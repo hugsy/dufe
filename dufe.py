@@ -1,8 +1,10 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 #
 # DUFE : Dummiest Universal Fuzzer Ever
 #
+# Works out-of-the-box on Python2 > 2.6 and Python3.x
 #
+
 from __future__ import print_function
 
 import ast
@@ -16,10 +18,13 @@ import time
 import copy
 import resource
 import glob
+import signal
+import shutil
 import multiprocessing
 
 import mutators
 import fuzzrange
+
 
 __author__ = '@hugsy'
 __version__ = 0.01
@@ -33,8 +38,7 @@ class Session:
         self.workers = []
         self.workers_lock = multiprocessing.Lock()
         self.max_workers = 0
-        self.worker_id = 0
-
+        self.worker_id = 1
         self.start_time = 0
         self.end_time = 0
         return
@@ -96,22 +100,33 @@ def write_fuzzfile(sess, data):
     return fname
 
 
+def sighandler():
+    signal.signal(signal.SIGSEGV, handle_sig)
+    return
+
+def handle_sig(signum, frame):
+    return
+
 def spawn_process(sess, fname):
     try:
         cmd = sess.command.replace( sess.template_file, fname )
         sess.logger.debug("Executing command: %s" % cmd)
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, preexec_fn=sighandler)
         out, err = p.communicate()
         pid = p.pid
         p.wait()
         retcode = p.returncode
-        if b"Segmentation fault" in err:
-            sess.logger.debug("Moving coredump in '%s/'" % sess.core_dir)
-            subprocess.call(["mv", ] + glob.glob("*.core") + [sess.core_dir, ])
-            raise Exception(err.strip())
+
+        # check retcode
+        if retcode and os.WIFSIGNALED(retcode):
+            sig = os.WTERMSIG(retcode)
+            if sig == signal.SIGSEGV:
+                for f in glob.glob("*.core"):
+                    shutil.move(f, sess.core_dir)
+                raise Exception("[%d] Killed with SIGSEGV, coredump saved" % pid)
 
     except Exception as e:
-        sess.logger.warning("[%d] '%s' : raised '%s'" % (pid, cmd, e,))
+        sess.logger.warning("[%d] '%s': %s" % (pid, cmd, e,))
 
     return (pid, retcode, cmd)
 
@@ -192,7 +207,9 @@ def show_mutators():
     print ("Available mutators:")
     for key in mutators.__dict__.keys():
         if key.startswith("MUTATOR_"):
-            print("* %s" % key)
+            name = key
+            doc = mutators.__dict__[key].__doc__ if hasattr(mutators.__dict__[key], "__doc__") else "No description"
+            print("* %s: %s" % (key, doc))
     return
 
 
@@ -218,6 +235,7 @@ def main():
     parser.add_argument("-c", "--config",   help="Path to fuzz config file", type=str)
     parser.add_argument("--cpu",            help="Number of CPU to dedicate to fuzz (defaults to your number of CPU minus 1)", default=multiprocessing.cpu_count()-1, type=int)
     parser.add_argument("-l", "--list",     help="Display available mutators and exit", action="store_true")
+    parser.add_argument("-n", "--dry-run",  help="Performs a dry-run: init the structures but do not start fuzzing", action="store_true", default=False, dest="dryrun")
     parser.add_argument("-V", "--version",  help="Show version", action="version", version="%(prog)s " + "%.2f" % __version__)
     parser.add_argument("-d", "--debug",    help="Set the verbosity to DEBUG level", action="store_true", default=False)
     args = parser.parse_args()
@@ -254,6 +272,10 @@ def main():
             sess.logger.info("New FuzzRange created: %s" % str(current_range))
             fuzzranges.append( current_range )
 
+    if len(fuzzranges)==0:
+        sess.logger.info("Nothing to fuzz...")
+        exit(0)
+
     # map data from template in memory
     template = sess.template_file
     original_data = read_file( template )
@@ -265,7 +287,11 @@ def main():
 
     if args.cpu == multiprocessing.cpu_count():
         sess.logger.warning("You're using all the CPUs available on your system for this fuzz task.")
-        sess.logger.warning("This may distablize your system.")
+        sess.logger.warning("This may distabilize your system.")
+
+    if sess.keep_fuzzfiles in ("True", "true", 1, True):
+        sess.logger.warning("You have chosen not to delete fuzz test cases generated.")
+        sess.logger.warning("This is a dangerous option that may saturate your directory.")
 
     # start fuzzing
     sess.logger.info("Starting session '%s': cmd='%s' orig='%s' fuzzdir='%s' cpu=%s" % (sess.session_name,
@@ -273,20 +299,20 @@ def main():
                                                                                         sess.template_file,
                                                                                         sess.fuzzfiles_dir,
                                                                                         sess.max_workers,))
-
     sess.start_time = time.time()
     try:
-        fuzz(sess, original_data, fuzzranges)
+        if not args.dryrun:
+            fuzz(sess, original_data, fuzzranges)
     except KeyboardInterrupt:
         pass
-
     sess.end_time = time.time()
+
+    execution_time = sess.end_time - sess.start_time
     sess.logger.info("Ending session '%s'" % sess.session_name)
     sess.logger.info("%d tasks executed" % sess.worker_id)
-    sess.logger.info("Execution time: %.5f" % (sess.end_time - sess.start_time))
+    sess.logger.info("Execution time: %.4f sec (average=%.4f sec/task)" % (execution_time,
+                                                                           execution_time/sess.worker_id))
     return
-
-
 
 
 if __name__ == "__main__":

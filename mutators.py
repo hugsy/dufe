@@ -3,15 +3,17 @@ import struct
 
 
 def MUTATOR_PERMUTE_ALL(original_data, keep_orginal_size=False):
+    """Shuffle all bytes at specific offset, and iterate over the permutations."""
     for perm in itertools.permutations(original_data):
-        perm_b = "".join( [ x for x in perm ] )
+        perm_b = b"".join( [ x for x in perm ] )
         yield( perm_b  )
 
 
 def MUTATOR_FORMAT_STRING(original_data, keep_orginal_size=False):
+    """Insert format strings."""
     values = [
-        '%s'*400,
-        '%p'*400,
+        b'%s'*400,
+        b'%p'*400,
         ]
 
     for value in values:
@@ -19,10 +21,11 @@ def MUTATOR_FORMAT_STRING(original_data, keep_orginal_size=False):
 
 
 def MUTATOR_STRING_OVERFLOW(raw, keep_orginal_size=False):
+    """Insert big buffers to attempt triggering overflows."""
     values = [
-        'A'     * 10000,
-        '\xff'      * 10000,
-        '%x'    * 5000,
+        b'A'     * 10000,
+        b'\xff'  * 10000,
+        b'%x'    * 5000,
         ]
 
     for value in values:
@@ -34,6 +37,7 @@ def MUTATOR_STRING_OVERFLOW(raw, keep_orginal_size=False):
 
 
 def MUTATOR_CHAR(original_data, keep_orginal_size=False):
+    """Return all possible bytes in [0, 256[."""
     values = range(0, 256)
     for value in values:
         yield( chr(value) )
@@ -41,6 +45,7 @@ def MUTATOR_CHAR(original_data, keep_orginal_size=False):
 
 
 def MUTATOR_SHORT(original_data, keep_orginal_size=False):
+    """Return all possible bytes in [0, 65536[."""
     values = range(0, 65536)
     for value in values:
         yield( struct.pack("<H", value) )
@@ -48,6 +53,7 @@ def MUTATOR_SHORT(original_data, keep_orginal_size=False):
 
 
 def MUTATOR_SHORT_OVERFLOW(original_data, keep_orginal_size=False):
+    """Insert incorrect short values (2 bytes) to attempt triggering overflows."""
     values = [ 0, 0x1000, 0xf000, 0xffff, 0xfffe, 0x8000, ]
     for value in values:
         yield( struct.pack("<H", value) )
@@ -55,6 +61,7 @@ def MUTATOR_SHORT_OVERFLOW(original_data, keep_orginal_size=False):
 
 
 def MUTATOR_INTEGER_OVERFLOW(original_data, keep_orginal_size=False):
+    """Insert incorrect int values (4 bytes) to attempt triggering overflows."""
     values = [
         0,
         0x100,
@@ -75,6 +82,7 @@ def MUTATOR_INTEGER_OVERFLOW(original_data, keep_orginal_size=False):
     return
 
 def MUTATOR_LONG_OVERFLOW(original_data, keep_orginal_size=False):
+    """Insert incorrect long values (8 bytes) to attempt triggering overflows."""
     values = [ 0,
            0xf000000000000000, 0xffffffffffffffff,
            0xfffffffffffffffe, 0x8000000000000000,
@@ -87,12 +95,10 @@ def MUTATOR_LONG_OVERFLOW(original_data, keep_orginal_size=False):
     return
 
 def MUTATOR_SQL_INJECTION(original_data, keep_orginal_size=False):
-    values = [
-        "' OR 1=1;-- ",
-        "') OR 1=1;--",
-        '" OR 1=1;-- ',
-        '") OR 1=1;--',
-        ]
+    """Insert known SQL injection patterns."""
+    values = [ b"' OR 1=1;-- ", b"') OR 1=1;--",
+               b'" OR 1=1;-- ', b'") OR 1=1;--',
+    ]
 
     for value in values:
         yield( value )
@@ -100,6 +106,7 @@ def MUTATOR_SQL_INJECTION(original_data, keep_orginal_size=False):
     return
 
 def MUTATOR_HTML_TAGS(original_data, keep_orginal_size=False):
+    """Iterate over all known HTML tags."""
     values = [ # from http://www.w3schools.com/tags
         "a",
         "abbr",
