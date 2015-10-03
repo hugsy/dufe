@@ -14,7 +14,7 @@ class FuzzRange:
         return  "FuzzRange[%d,%d](len=%d) -> %s" % (self.start,
                                                     self.end,
                                                     self.size,
-                                                    ",".join([x.__name__+'()' for x in self.mutators]))
+                                                    ",".join([x.__name__ for x in self.mutators]))
 
 
     @property

@@ -27,16 +27,20 @@ __doc__ = """Possibly the dummiest multi purpose fuzzer"""
 
 
 
-class ConfigParserWrapper:
+class Session:
 
     def __init__(self):
+        self.workers = []
+        self.workers_lock = multiprocessing.Lock()
+        self.max_workers = 0
+        self.worker_id = 0
+
+        self.start_time = 0
+        self.end_time = 0
         return
 
     @staticmethod
     def new(config_file):
-        class ConfigSession(object):
-            pass
-
         if sys.version_info.major == 2:
             CP = __import__("ConfigParser")
         elif sys.version_info.major == 3:
@@ -46,7 +50,7 @@ class ConfigParserWrapper:
 
         conf = CP.ConfigParser()
         conf.read( config_file )
-        sess = ConfigSession()
+        sess = Session()
         for key, value in conf.items("Session"):
             setattr(sess, key, value)
 
@@ -61,13 +65,16 @@ class FuzzLoggingFormatter(logging.Formatter):
 
 
 def hexdump(src, length=0x10):
-    f=''.join([(len(repr(chr(x)))==3) and chr(x) or '.' for x in range(256)])
+    if sys.version_info.major == 3:
+        f=b''.join([(len(repr(chr(x).encode("utf-8")))==3) and chr(x).encode("utf-8") or b'.' for x in range(256)])
+    else:
+        f=''.join([(len(repr(chr(x)))==3) and chr(x) or '.' for x in range(256)])
     n=0
     result=''
 
     while src:
        s,src = src[:length],src[length:]
-       hexa = ' '.join(["%02X"%ord(x) for x in s])
+       hexa = b' '.join([b"%02X"%x for x in s]) if sys.version_info.major==3 else ' '.join(["%02X"%ord(x) for x in s])
        s = s.translate(f)
        result += "%04X   %-*s   %s\n" % (n, length*3, hexa, s)
        n+=length
@@ -189,16 +196,19 @@ def show_mutators():
     return
 
 
-def init_logger(sess, quiet_mode):
+def init_logger(sess, args):
     fhandler = logging.FileHandler( sess.logfile.format(date=int(time.time())) )
     fhandler.setFormatter( FuzzLoggingFormatter() )
     shandler = logging.StreamHandler()
     shandler.setFormatter( FuzzLoggingFormatter() )
     log = logging.getLogger( 'fuzzer' )
-    log.setLevel( logging.INFO )
+    if args.debug:
+        log.setLevel( logging.DEBUG )
+    else:
+        log.setLevel( logging.INFO )
     log.addHandler( fhandler )
-    if not quiet_mode: log.addHandler( shandler )
-    setattr(sess,"logger", log)
+    if not args.quiet: log.addHandler( shandler )
+    sess.logger = log
     return
 
 
@@ -206,9 +216,10 @@ def main():
     parser = argparse.ArgumentParser(prog = sys.argv[0])
     parser.add_argument("-q", "--quiet",    help="Do not print log event on stdout", action="store_true", default=False)
     parser.add_argument("-c", "--config",   help="Path to fuzz config file", type=str)
-    parser.add_argument("--cpu",            help="Number of CPU to dedicate to fuzz", default=multiprocessing.cpu_count()-1, type=int)
+    parser.add_argument("--cpu",            help="Number of CPU to dedicate to fuzz (defaults to your number of CPU minus 1)", default=multiprocessing.cpu_count()-1, type=int)
     parser.add_argument("-l", "--list",     help="Display available mutators and exit", action="store_true")
     parser.add_argument("-V", "--version",  help="Show version", action="version", version="%(prog)s " + "%.2f" % __version__)
+    parser.add_argument("-d", "--debug",    help="Set the verbosity to DEBUG level", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.list:
@@ -224,10 +235,11 @@ def main():
         exit(1)
 
     # init new session
-    sess = ConfigParserWrapper.new( args.config )
+    sess = Session.new( args.config )
+    sess.max_workers = args.cpu
 
     # init logger
-    init_logger(sess, args.quiet)
+    init_logger(sess, args)
 
     # modify system resource
     resource.setrlimit(resource.RLIMIT_CORE, (-1, -1))
@@ -246,13 +258,7 @@ def main():
     template = sess.template_file
     original_data = read_file( template )
     sess.logger.info("Read template file '%s' (length=%d bytes)" % (template, len(original_data)))
-    # sess.logger.debug("Original data:\n%s", hexdump(original_data).strip())
-
-    # create a pool of workers
-    setattr(sess, "workers", [])
-    setattr(sess, "workers_lock", multiprocessing.Lock())
-    setattr(sess, "max_workers", args.cpu)
-    setattr(sess, "worker_id", 0)
+    sess.logger.debug("Original data:\n%s", hexdump(original_data).strip())
 
     # sort fuzzranges by range.start
     fuzzranges.sort( key=lambda x: x.start, reverse=False )
@@ -268,12 +274,16 @@ def main():
                                                                                         sess.fuzzfiles_dir,
                                                                                         sess.max_workers,))
 
+    sess.start_time = time.time()
     try:
         fuzz(sess, original_data, fuzzranges)
     except KeyboardInterrupt:
-        sess.logger.info("Ending session '%s'" % sess.session_name)
+        pass
 
+    sess.end_time = time.time()
+    sess.logger.info("Ending session '%s'" % sess.session_name)
     sess.logger.info("%d tasks executed" % sess.worker_id)
+    sess.logger.info("Execution time: %.5f" % (sess.end_time - sess.start_time))
     return
 
 
