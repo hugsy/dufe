@@ -16,7 +16,7 @@ import subprocess
 import logging
 import time
 import copy
-import resource
+import platform
 import glob
 import signal
 import shutil
@@ -41,6 +41,7 @@ class Session:
         self.worker_id = 1
         self.start_time = 0
         self.end_time = 0
+        self.incorrect_retcode = 0
         return
 
     @staticmethod
@@ -131,10 +132,19 @@ def spawn_process(sess, fname):
     return (pid, retcode, cmd)
 
 
-def mangle_data(data, fuzzblob, fuzzrange):
-    d = copy.deepcopy(data)
-    return b"".join( [d[:fuzzrange.start], fuzzblob, d[fuzzrange.end+1:]] )
+def insert_fuzzed_data(original_data, fuzzed_data, fuzzrange):
+    d = copy.deepcopy(original_data)
+    return b"".join( [d[:fuzzrange.start], fuzzed_data, d[fuzzrange.start+len(fuzzed_data)+1:]] )
 
+
+def replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange):
+    d = copy.deepcopy(original_data)
+    return b"".join( [d[:fuzzrange.start], fuzzed_data, d[fuzzrange.end+1:]] )
+
+
+def mangle_data(original_data, fuzzed_data, fuzzrange):
+    return insert_fuzzed_data(original_data, fuzzed_data, fuzzrange)
+    #return replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange)
 
 def start_fuzzcase(session, data):
     try:
@@ -148,6 +158,8 @@ def start_fuzzcase(session, data):
             session.logger.debug("PID=%d (cmd='%s') returned with %d" % (pid, cmd, retcode))
         if not hasattr(session, "keep_fuzzfiles") or session.keep_fuzzfiles not in (True, "True", 1):
             os.unlink( fuzz_filename )
+    else:
+        session.incorrect_retcode += 1
     return
 
 
@@ -177,18 +189,23 @@ def fuzz(sess, data, fuzzranges):
 
         else:
 
-            if len(sess.workers) >= sess.max_workers:
-                for p in sess.workers:
-                    p.join()
-                    sess.workers.remove(p)
-                    break
+            if platform.system() == 'Linux':
+                if len(sess.workers) >= sess.max_workers:
+                    for p in sess.workers:
+                        p.join()
+                        sess.workers.remove(p)
+                        break
 
-            sess.workers_lock.acquire()
-            p = multiprocessing.Process(target=start_fuzzcase, args=(sess, new_data))
-            sess.workers.append(p)
-            sess.worker_id += 1
-            sess.workers_lock.release()
-            p.start()
+                sess.workers_lock.acquire()
+                p = multiprocessing.Process(target=start_fuzzcase, args=(sess, new_data))
+                sess.workers.append(p)
+                sess.worker_id += 1
+                sess.workers_lock.release()
+                p.start()
+            else:
+                # multiprocessing does not work on windows
+                rc = start_fuzzcase(sess, new_data)
+
         del new_data
     return
 
@@ -260,7 +277,9 @@ def main():
     init_logger(sess, args)
 
     # modify system resource
-    resource.setrlimit(resource.RLIMIT_CORE, (-1, -1))
+    if platform.machine() == "Linux":
+        rsc = __import__("resource")
+        rsc.setrlimit(resource.RLIMIT_CORE, (-1, -1))
 
     # init fuzz ranges
     ranges = ast.literal_eval( sess.ranges )
@@ -309,6 +328,7 @@ def main():
 
     execution_time = sess.end_time - sess.start_time
     sess.logger.info("Ending session '%s'" % sess.session_name)
+    sess.logger.info("%d incorrect retcodes were found" % sess.incorrect_retcode)
     sess.logger.info("%d tasks executed" % sess.worker_id)
     sess.logger.info("Execution time: %.4f sec (average=%.4f sec/task)" % (execution_time,
                                                                            execution_time/sess.worker_id))
