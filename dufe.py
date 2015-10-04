@@ -33,6 +33,8 @@ __doc__ = """Possibly the dummiest multi purpose fuzzer"""
 
 
 class Session:
+    INSERT_FUZZ_POLICY = 0      # insert fuzzed data in place
+    REPLACE_FUZZ_POLICY = 1     # replace targeted block with fuzzed data (may overwrite adjacent structure)
 
     def __init__(self):
         self.workers = []
@@ -42,6 +44,7 @@ class Session:
         self.start_time = 0
         self.end_time = 0
         self.incorrect_retcode = 0
+        self.policy = Session.INSERT_FUZZ_POLICY
         return
 
     @staticmethod
@@ -53,12 +56,16 @@ class Session:
         else:
             raise Exception("Unknown Python version")
 
-        conf = CP.ConfigParser()
+        conf = CP.SafeConfigParser()
         conf.read( config_file )
         sess = Session()
         for key, value in conf.items("Session"):
             setattr(sess, key, value)
 
+        if sess.policy in ("replace", "REPLACE"):
+            sess.policy = Session.REPLACE_FUZZ_POLICY
+        else:
+            sess.policy = Session.INSERT_FUZZ_POLICY
         return sess
 
 
@@ -101,31 +108,29 @@ def write_fuzzfile(sess, data):
     return fname
 
 
-def sighandler():
-    signal.signal(signal.SIGSEGV, handle_sig)
-    return
-
-def handle_sig(signum, frame):
-    return
-
 def spawn_process(sess, fname):
     try:
         cmd = sess.command.replace( sess.template_file, fname )
         sess.logger.debug("Executing command: %s" % cmd)
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, preexec_fn=sighandler)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
         out, err = p.communicate()
         pid = p.pid
         p.wait()
         retcode = p.returncode
 
         # check retcode
-        if retcode and os.WIFSIGNALED(retcode):
-            sig = os.WTERMSIG(retcode)
-            if sig == signal.SIGSEGV:
-                for f in glob.glob("*.core"):
-                    shutil.move(f, sess.core_dir)
-                raise Exception("[%d] Killed with SIGSEGV, coredump saved" % pid)
-
+        if retcode:
+             if platform.system() == 'Linux':
+                if os.WIFSIGNALED(retcode):
+                    sig = os.WTERMSIG(retcode)
+                    if sig == signal.SIGSEGV:
+                        session.incorrect_retcode += 1
+                        for f in glob.glob("*.core"): shutil.move(f, sess.core_dir)
+                        raise Exception("[%d] Killed with SIGSEGV, coredump saved" % pid)
+                    elif sig == signal.SIGPIPE:
+                        session.incorrect_retcode += 1
+             else:
+                 raise Exception("[%d] Died with retcode=%d" % (pid, retcode))
     except Exception as e:
         sess.logger.warning("[%d] '%s': %s" % (pid, cmd, e,))
 
@@ -134,17 +139,21 @@ def spawn_process(sess, fname):
 
 def insert_fuzzed_data(original_data, fuzzed_data, fuzzrange):
     d = copy.deepcopy(original_data)
-    return b"".join( [d[:fuzzrange.start], fuzzed_data, d[fuzzrange.start+len(fuzzed_data)+1:]] )
+    return b"".join( [d[:fuzzrange.start], fuzzed_data, d[fuzzrange.end+1:]] )
 
 
 def replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange):
     d = copy.deepcopy(original_data)
-    return b"".join( [d[:fuzzrange.start], fuzzed_data, d[fuzzrange.end+1:]] )
+    return b"".join( [d[:fuzzrange.start], fuzzed_data, d[fuzzrange.start+len(fuzzed_data)+1:]] )
 
 
-def mangle_data(original_data, fuzzed_data, fuzzrange):
-    return insert_fuzzed_data(original_data, fuzzed_data, fuzzrange)
-    #return replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange)
+def mangle_data(session, original_data, fuzzed_data, fuzzrange):
+    if session.policy == Session.INSERT_FUZZ_POLICY:
+        return insert_fuzzed_data(original_data, fuzzed_data, fuzzrange)
+    elif session.policy == Session.REPLACE_FUZZ_POLICY:
+        return replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange)
+    raise Exception("GTFO")
+
 
 def start_fuzzcase(session, data):
     try:
@@ -158,8 +167,6 @@ def start_fuzzcase(session, data):
             session.logger.debug("PID=%d (cmd='%s') returned with %d" % (pid, cmd, retcode))
         if not hasattr(session, "keep_fuzzfiles") or session.keep_fuzzfiles not in (True, "True", 1):
             os.unlink( fuzz_filename )
-    else:
-        session.incorrect_retcode += 1
     return
 
 
@@ -170,7 +177,7 @@ def fuzz(sess, data, fuzzranges):
 
     for fuzzblob in current_range.get_next_value(replaced_bytes):
         sess.logger.debug("[%d] Current range: %d -> %d, len(blob)=%d" % (len(fuzzranges), start, end, len(fuzzblob)))
-        new_data = mangle_data(data, fuzzblob, current_range)
+        new_data = mangle_data(sess, data, fuzzblob, current_range)
 
         if len(fuzzranges) > 1:
             next_range = fuzzranges[1]
@@ -189,6 +196,7 @@ def fuzz(sess, data, fuzzranges):
 
         else:
 
+            sess.logger.debug("Sending\n%s" % hexdump(new_data))
             if platform.system() == 'Linux':
                 if len(sess.workers) >= sess.max_workers:
                     for p in sess.workers:
@@ -250,7 +258,7 @@ def main():
     parser = argparse.ArgumentParser(prog = sys.argv[0])
     parser.add_argument("-q", "--quiet",    help="Do not print log event on stdout", action="store_true", default=False)
     parser.add_argument("-c", "--config",   help="Path to fuzz config file", type=str)
-    parser.add_argument("--cpu",            help="Number of CPU to dedicate to fuzz (defaults to your number of CPU minus 1)", default=multiprocessing.cpu_count()-1, type=int)
+    parser.add_argument("--cpu",            help="Number of CPU to dedicate to fuzz (defaults to your number of CPU minus 1)", default=1, type=int)
     parser.add_argument("-l", "--list",     help="Display available mutators and exit", action="store_true")
     parser.add_argument("-n", "--dry-run",  help="Performs a dry-run: init the structures but do not start fuzzing", action="store_true", default=False, dest="dryrun")
     parser.add_argument("-V", "--version",  help="Show version", action="version", version="%(prog)s " + "%.2f" % __version__)
@@ -268,6 +276,7 @@ def main():
     if not 1 <= args.cpu <= multiprocessing.cpu_count():
         print("The number of CPUs to use must in [1, %d]" % multiprocessing.cpu_count())
         exit(1)
+
 
     # init new session
     sess = Session.new( args.config )
@@ -296,13 +305,17 @@ def main():
         exit(0)
 
     # map data from template in memory
+    if not is_readable_file(sess.template_file):
+        sess.logger.error("'%s' is not readable" % sess.template_file)
+        exit(1)
+
     template = sess.template_file
     original_data = read_file( template )
     sess.logger.info("Read template file '%s' (length=%d bytes)" % (template, len(original_data)))
     sess.logger.debug("Original data:\n%s", hexdump(original_data).strip())
 
     # sort fuzzranges by range.start
-    fuzzranges.sort( key=lambda x: x.start, reverse=False )
+    # fuzzranges.sort( key=lambda x: x.start, reverse=False )
 
     if args.cpu == multiprocessing.cpu_count():
         sess.logger.warning("You're using all the CPUs available on your system for this fuzz task.")
