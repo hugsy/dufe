@@ -4,6 +4,8 @@
 #
 # Works out-of-the-box on Python2 > 2.6 and Python3.x
 #
+# Supports Windows, Linux and FreeBSD (maybe OSX)
+#
 
 from __future__ import print_function
 
@@ -16,11 +18,11 @@ import subprocess
 import logging
 import time
 import copy
-import platform
 import glob
 import signal
 import shutil
 import multiprocessing
+import ctypes
 
 import mutators
 import fuzzrange
@@ -30,7 +32,9 @@ __author__ = '@hugsy'
 __version__ = 0.01
 __doc__ = """Possibly the dummiest multi purpose fuzzer"""
 
-
+OS_LINUX     = 0
+OS_WINDOWS   = 1
+OS_FREEBSD   = 2
 
 class Session:
     INSERT_FUZZ_POLICY = 0      # insert fuzzed data in place
@@ -45,6 +49,7 @@ class Session:
         self.end_time = 0
         self.incorrect_retcode = 0
         self.policy = Session.INSERT_FUZZ_POLICY
+        self.os = OS_LINUX
         return
 
     @staticmethod
@@ -108,11 +113,20 @@ def write_fuzzfile(sess, data):
     return fname
 
 
-def spawn_process(sess, fname):
+def spawn_windows_process(sess, fname):
+    cmd = sess.command.replace( sess.template_file, fname )
+    sess.logger.debug("Executing command: %s" % cmd)
+    p = subprocess.Popen(cmd, shell=True)
+    time.sleep(3)
+    ctypes.windll.kernel32.TerminateProcess(int(p._handle), -1)
+    return
+
+
+def spawn_linux_process(sess, fname):
     try:
         cmd = sess.command.replace( sess.template_file, fname )
         sess.logger.debug("Executing command: %s" % cmd)
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    	p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
         out, err = p.communicate()
         pid = p.pid
         p.wait()
@@ -120,17 +134,16 @@ def spawn_process(sess, fname):
 
         # check retcode
         if retcode:
-             if platform.system() == 'Linux':
-                if os.WIFSIGNALED(retcode):
-                    sig = os.WTERMSIG(retcode)
-                    if sig == signal.SIGSEGV:
-                        session.incorrect_retcode += 1
-                        for f in glob.glob("*.core"): shutil.move(f, sess.core_dir)
-                        raise Exception("[%d] Killed with SIGSEGV, coredump saved" % pid)
-                    elif sig == signal.SIGPIPE:
-                        session.incorrect_retcode += 1
-             else:
-                 raise Exception("[%d] Died with retcode=%d" % (pid, retcode))
+            if os.WIFSIGNALED(retcode):
+                sig = os.WTERMSIG(retcode)
+                if sig == signal.SIGSEGV:
+                    session.incorrect_retcode += 1
+                    for f in glob.glob("*.core"): shutil.move(f, sess.core_dir)
+                    raise Exception("[%d] Killed with SIGSEGV, coredump saved" % pid)
+                elif sig == signal.SIGPIPE:
+                    session.incorrect_retcode += 1
+        else:
+            raise Exception("[%d] Died with retcode=%d" % (pid, retcode))
     except Exception as e:
         sess.logger.warning("[%d] '%s': %s" % (pid, cmd, e,))
 
@@ -158,7 +171,10 @@ def mangle_data(session, original_data, fuzzed_data, fuzzrange):
 def start_fuzzcase(session, data):
     try:
         fuzz_filename = write_fuzzfile(session, data )
-        pid, retcode, cmd = spawn_process(session, fuzz_filename)
+        if sess.os == OS_WINDOWS:
+            pid, retcode, cmd = spawn_windows_process(session, fuzz_filename)
+        else:
+            pid, retcode, cmd = spawn_linux_process(session, fuzz_filename)
     except KeyboardInterrupt:
         retcode = -1
 
@@ -197,7 +213,7 @@ def fuzz(sess, data, fuzzranges):
         else:
 
             sess.logger.debug("Sending\n%s" % hexdump(new_data))
-            if platform.system() == 'Linux':
+            if self.os == OS_LINUX:
                 if len(sess.workers) >= sess.max_workers:
                     for p in sess.workers:
                         p.join()
@@ -210,9 +226,11 @@ def fuzz(sess, data, fuzzranges):
                 sess.worker_id += 1
                 sess.workers_lock.release()
                 p.start()
-            else:
+            elif self.os == OS_WINDOWS:
                 # multiprocessing does not work on windows
                 rc = start_fuzzcase(sess, new_data)
+            else:
+                raise Exception("Invalid OS")
 
         del new_data
     return
@@ -263,6 +281,7 @@ def main():
     parser.add_argument("-n", "--dry-run",  help="Performs a dry-run: init the structures but do not start fuzzing", action="store_true", default=False, dest="dryrun")
     parser.add_argument("-V", "--version",  help="Show version", action="version", version="%(prog)s " + "%.2f" % __version__)
     parser.add_argument("-d", "--debug",    help="Set the verbosity to DEBUG level", action="store_true", default=False)
+    parser.add_argument("--sort",           help="Sort ranges by offset", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.list:
@@ -286,9 +305,13 @@ def main():
     init_logger(sess, args)
 
     # modify system resource
-    if platform.machine() == "Linux":
+    if sys.platform.startswith("linux"):
         rsc = __import__("resource")
-        rsc.setrlimit(resource.RLIMIT_CORE, (-1, -1))
+        rsc.setrlimit( resource.RLIMIT_CORE, (-1, -1) )
+        sess.os = OS_LINUX
+    elif sys.platform.startswith("win32"):
+        sess.os = OS_WINDOWS
+
 
     # init fuzz ranges
     ranges = ast.literal_eval( sess.ranges )
@@ -315,7 +338,8 @@ def main():
     sess.logger.debug("Original data:\n%s", hexdump(original_data).strip())
 
     # sort fuzzranges by range.start
-    # fuzzranges.sort( key=lambda x: x.start, reverse=False )
+    if args.sort:
+        fuzzranges.sort( key=lambda x: x.start, reverse=False )
 
     if args.cpu == multiprocessing.cpu_count():
         sess.logger.warning("You're using all the CPUs available on your system for this fuzz task.")
