@@ -9,28 +9,29 @@
 
 from __future__ import print_function
 
-import ast
 import argparse
-import sys
-import os
-import tempfile
-import subprocess
-import logging
-import time
+import ast
 import copy
-import glob
-import signal
-import shutil
-import multiprocessing
 import ctypes
+import glob
+import logging
+import multiprocessing
+import os
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 
 import mutators
 import fuzzrange
 
 
-__author__ = '@hugsy'
-__version__ = 0.01
-__doc__ = """Possibly the dummiest multi purpose fuzzer"""
+__author__    = "@hugsy"
+__version__   = 0.02
+__doc__       = """Possibly the dummiest multi purpose fuzzer"""
 
 OS_LINUX     = 0
 OS_WINDOWS   = 1
@@ -98,8 +99,7 @@ def hexdump(src, length=0x10):
 
     return result
 
-
-def write_fuzzfile(sess, data):
+def write_fuzzfile(sess, data, nb_worker=0):
     if not hasattr(sess, "use_fuzzfile"):
         fd, fname = tempfile.mkstemp( prefix="fuzzcase_", dir=sess.fuzzfiles_dir )
     else:
@@ -170,8 +170,8 @@ def mangle_data(session, original_data, fuzzed_data, fuzzrange):
 
 def start_fuzzcase(session, data):
     try:
-        fuzz_filename = write_fuzzfile(session, data )
-        if sess.os == OS_WINDOWS:
+        fuzz_filename = write_fuzzfile(session, data, nb_worker)
+        if session.os == OS_WINDOWS:
             pid, retcode, cmd = spawn_windows_process(session, fuzz_filename)
         else:
             pid, retcode, cmd = spawn_linux_process(session, fuzz_filename)
@@ -190,6 +190,7 @@ def fuzz(sess, data, fuzzranges):
     current_range = fuzzranges[0]
     start, end = current_range.start, current_range.end
     replaced_bytes = data[ start:end ]
+    nb_worker = 0
 
     for fuzzblob in current_range.get_next_value(replaced_bytes):
         sess.logger.debug("[%d] Current range: %d -> %d, len(blob)=%d" % (len(fuzzranges), start, end, len(fuzzblob)))
@@ -213,7 +214,7 @@ def fuzz(sess, data, fuzzranges):
         else:
 
             sess.logger.debug("Sending\n%s" % hexdump(new_data))
-            if self.os == OS_LINUX:
+            if sess.os == OS_LINUX:      
                 if len(sess.workers) >= sess.max_workers:
                     for p in sess.workers:
                         p.join()
