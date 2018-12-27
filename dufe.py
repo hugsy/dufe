@@ -4,42 +4,52 @@
 #
 # Works out-of-the-box on Python2 > 2.6 and Python3.x
 #
-# Supports Windows, Linux and FreeBSD (maybe OSX)
+# Support tested on Windows, Linux and FreeBSD (maybe OSX)
 #
 
 from __future__ import print_function
 
+
 import argparse
 import ast
+import configparser
 import copy
 import ctypes
+import enum
 import glob
 import logging
 import multiprocessing
 import os
-import resource
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import platform
 
 import mutators
 import fuzzrange
 
 
-__author__    = "@hugsy"
-__version__   = 0.02
+__author__    = """@_hugsy_"""
+__version__   = 0.03
 __doc__       = """Possibly the dummiest multi purpose fuzzer"""
 
-OS_LINUX     = 0
-OS_WINDOWS   = 1
-OS_FREEBSD   = 2
 
-class Session:
+
+class Os(enum.Enum):
+    LINUX     = 0
+    WINDOWS   = 1
+    FREEBSD   = 2
+
+
+class FuzzingPolicy(enum.Enum):
     INSERT_FUZZ_POLICY = 0      # insert fuzzed data in place
     REPLACE_FUZZ_POLICY = 1     # replace targeted block with fuzzed data (may overwrite adjacent structure)
+
+
+class Session:
 
     def __init__(self):
         self.workers = []
@@ -49,35 +59,67 @@ class Session:
         self.start_time = 0
         self.end_time = 0
         self.incorrect_retcode = 0
-        self.policy = Session.INSERT_FUZZ_POLICY
-        self.os = OS_LINUX
+        self.policy = FuzzingPolicy.INSERT_FUZZ_POLICY
+
+        os = platform.system()
+        if os == "Linux":
+            self.init_as_linux()
+        elif os == "Windows":
+            self.init_as_windows()
+        else:
+            raise Exception("unsupported OS")
         return
 
-    @staticmethod
-    def new(config_file):
-        if sys.version_info.major == 2:
-            CP = __import__("ConfigParser")
-        elif sys.version_info.major == 3:
-            CP = __import__("configparser")
-        else:
-            raise Exception("Unknown Python version")
 
-        conf = CP.SafeConfigParser()
+    def init_as_linux(self):
+        self.os = Os.LINUX
+        rsc = __import__("resource")
+        rsc.setrlimit( rsc.RLIMIT_CORE, (-1, -1) )
+        return
+
+
+    def init_as_windows(self):
+        self.os = Os.WINDOWS
+        return
+
+
+    def import_configuration_settings(self, config_file):
+        conf = configparser.SafeConfigParser()
         conf.read( config_file )
-        sess = Session()
         for key, value in conf.items("Session"):
-            setattr(sess, key, value)
+            setattr(self, key, value)
 
-        if sess.policy in ("replace", "REPLACE"):
-            sess.policy = Session.REPLACE_FUZZ_POLICY
+        if self.policy in ("replace", "REPLACE"):
+            self.policy = FuzzingPolicy.REPLACE_FUZZ_POLICY
         else:
-            sess.policy = Session.INSERT_FUZZ_POLICY
-        return sess
+            self.policy = FuzzingPolicy.INSERT_FUZZ_POLICY
+
+        if hasattr(self, "force_kill_after"):
+            self.force_kill_after = int(self.force_kill_after)
+        else:
+            self.force_kill_after = None
+        return
+
+
+    def init_logger(self, args):
+        fhandler = logging.FileHandler( self.logfile.format(date=int(time.time())) )
+        fhandler.setFormatter( FuzzLoggingFormatter() )
+        shandler = logging.StreamHandler()
+        shandler.setFormatter( FuzzLoggingFormatter() )
+        log = logging.getLogger( 'fuzzer' )
+        if args.debug:
+            log.setLevel( logging.DEBUG )
+        else:
+            log.setLevel( logging.INFO )
+        log.addHandler( fhandler )
+        if not args.quiet: log.addHandler( shandler )
+        self.logger = log
+        return
 
 
 class FuzzLoggingFormatter(logging.Formatter):
     def __init__(self):
-        fmt = '%(asctime)s %(name)-7s %(levelname)s : %(message)s'
+        fmt = "%(asctime)s %(name)-7s %(levelname)s : %(message)s"
         logging.Formatter.__init__(self, fmt, datefmt='%H:%M:%S')
         return
 
@@ -99,9 +141,10 @@ def hexdump(src, length=0x10):
 
     return result
 
+
 def write_fuzzfile(sess, data, nb_worker=0):
     if not hasattr(sess, "use_fuzzfile"):
-        fd, fname = tempfile.mkstemp( prefix="fuzzcase_", dir=sess.fuzzfiles_dir )
+        fd, fname = tempfile.mkstemp( prefix="sample_", dir=sess.testcase_dir )
     else:
         fname = sess.use_fuzzfile
         os.unlink( fname )
@@ -109,7 +152,6 @@ def write_fuzzfile(sess, data, nb_worker=0):
 
     os.write(fd, data)
     os.close(fd)
-
     return fname
 
 
@@ -117,16 +159,20 @@ def spawn_windows_process(sess, fname):
     cmd = sess.command.replace( sess.template_file, fname )
     sess.logger.debug("Executing command: %s" % cmd)
     p = subprocess.Popen(cmd, shell=True)
-    time.sleep(3)
-    ctypes.windll.kernel32.TerminateProcess(int(p._handle), -1)
-    return
+    if sess.force_kill_after:
+        time.sleep(int(sess.force_kill_after))
+        # ctypes.windll.kernel32.TerminateProcess(int(p._handle), -1)
+        p.kill()
+    else:
+        p.wait()
+    return (p.pid, p.returncode, cmd)
 
 
 def spawn_linux_process(sess, fname):
     try:
         cmd = sess.command.replace( sess.template_file, fname )
         sess.logger.debug("Executing command: %s" % cmd)
-    	p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
         out, err = p.communicate()
         pid = p.pid
         p.wait()
@@ -138,7 +184,7 @@ def spawn_linux_process(sess, fname):
                 sig = os.WTERMSIG(retcode)
                 if sig == signal.SIGSEGV:
                     session.incorrect_retcode += 1
-                    for f in glob.glob("*.core"): shutil.move(f, sess.core_dir)
+                    for f in glob.glob("*.core"): shutil.move(f, sesscrash_dir)
                     raise Exception("[%d] Killed with SIGSEGV, coredump saved" % pid)
                 elif sig == signal.SIGPIPE:
                     session.incorrect_retcode += 1
@@ -161,17 +207,18 @@ def replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange):
 
 
 def mangle_data(session, original_data, fuzzed_data, fuzzrange):
-    if session.policy == Session.INSERT_FUZZ_POLICY:
+    if session.policy == FuzzingPolicy.INSERT_FUZZ_POLICY:
         return insert_fuzzed_data(original_data, fuzzed_data, fuzzrange)
-    elif session.policy == Session.REPLACE_FUZZ_POLICY:
+    elif session.policy == FuzzingPolicy.REPLACE_FUZZ_POLICY:
         return replace_with_fuzzed_data(original_data, fuzzed_data, fuzzrange)
     raise Exception("GTFO")
 
 
 def start_fuzzcase(session, data):
+    nb_worker = 0
     try:
         fuzz_filename = write_fuzzfile(session, data, nb_worker)
-        if session.os == OS_WINDOWS:
+        if session.os == Os.WINDOWS:
             pid, retcode, cmd = spawn_windows_process(session, fuzz_filename)
         else:
             pid, retcode, cmd = spawn_linux_process(session, fuzz_filename)
@@ -181,7 +228,7 @@ def start_fuzzcase(session, data):
     if retcode < 128:
         if retcode > 0:
             session.logger.debug("PID=%d (cmd='%s') returned with %d" % (pid, cmd, retcode))
-        if not hasattr(session, "keep_fuzzfiles") or session.keep_fuzzfiles not in (True, "True", 1):
+        if not hasattr(session, "keep_testcases") or session.keep_testcases not in (True, "True", 1):
             os.unlink( fuzz_filename )
     return
 
@@ -214,7 +261,7 @@ def fuzz(sess, data, fuzzranges):
         else:
 
             sess.logger.debug("Sending\n%s" % hexdump(new_data))
-            if sess.os == OS_LINUX:      
+            if sess.os == Os.LINUX:
                 if len(sess.workers) >= sess.max_workers:
                     for p in sess.workers:
                         p.join()
@@ -227,7 +274,7 @@ def fuzz(sess, data, fuzzranges):
                 sess.worker_id += 1
                 sess.workers_lock.release()
                 p.start()
-            elif self.os == OS_WINDOWS:
+            elif sess.os == Os.WINDOWS:
                 # multiprocessing does not work on windows
                 rc = start_fuzzcase(sess, new_data)
             else:
@@ -257,20 +304,6 @@ def show_mutators():
     return
 
 
-def init_logger(sess, args):
-    fhandler = logging.FileHandler( sess.logfile.format(date=int(time.time())) )
-    fhandler.setFormatter( FuzzLoggingFormatter() )
-    shandler = logging.StreamHandler()
-    shandler.setFormatter( FuzzLoggingFormatter() )
-    log = logging.getLogger( 'fuzzer' )
-    if args.debug:
-        log.setLevel( logging.DEBUG )
-    else:
-        log.setLevel( logging.INFO )
-    log.addHandler( fhandler )
-    if not args.quiet: log.addHandler( shandler )
-    sess.logger = log
-    return
 
 
 def main():
@@ -297,22 +330,14 @@ def main():
         print("The number of CPUs to use must in [1, %d]" % multiprocessing.cpu_count())
         exit(1)
 
-
     # init new session
-    sess = Session.new( args.config )
-    sess.max_workers = args.cpu
+    sess = Session()
+    sess.import_configuration_settings( args.config )
+    if not sess.max_workers:
+        sess.max_workers = args.cpu
 
     # init logger
-    init_logger(sess, args)
-
-    # modify system resource
-    if sys.platform.startswith("linux"):
-        rsc = __import__("resource")
-        rsc.setrlimit( resource.RLIMIT_CORE, (-1, -1) )
-        sess.os = OS_LINUX
-    elif sys.platform.startswith("win32"):
-        sess.os = OS_WINDOWS
-
+    sess.init_logger(args)
 
     # init fuzz ranges
     ranges = ast.literal_eval( sess.ranges )
@@ -346,7 +371,7 @@ def main():
         sess.logger.warning("You're using all the CPUs available on your system for this fuzz task.")
         sess.logger.warning("This may distabilize your system.")
 
-    if sess.keep_fuzzfiles in ("True", "true", 1, True):
+    if sess.keep_testcases in ("True", "true", 1, True):
         sess.logger.warning("You have chosen not to delete fuzz test cases generated.")
         sess.logger.warning("This is a dangerous option that may saturate your directory.")
 
@@ -354,7 +379,7 @@ def main():
     sess.logger.info("Starting session '%s': cmd='%s' orig='%s' fuzzdir='%s' cpu=%s" % (sess.session_name,
                                                                                         sess.command,
                                                                                         sess.template_file,
-                                                                                        sess.fuzzfiles_dir,
+                                                                                        sess.testcase_dir,
                                                                                         sess.max_workers,))
     sess.start_time = time.time()
     try:

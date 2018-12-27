@@ -264,3 +264,34 @@ def MUTATOR_BITFLIP(raw, keep_orginal_size=False):
             yield( str(mutated) )
 
     return
+
+
+def MUTATOR_BITFLIP(raw, keep_orginal_size=False):
+    """Performs bitflipping on input buffer."""
+
+    def bitflip(c, i):
+        """Horrible hackish implem of bitflipping: flips `i`-th bit of `c`"""
+        r = ''
+        for j, x in enumerate(bin(c)[2:]):
+            if j==i:
+                if x == '0':
+                    r+= '1'
+                else:
+                    r+='0'
+            else:
+                r+=x
+
+        return int(r, 2)
+
+
+    original = bytearray(raw[:])
+
+    for i, v in enumerate(original):
+
+        for j in range(7, -1, -1):
+            mutated = bytearray(raw[:])
+            v2 = bitflip(v, j)
+            mutated[i] = v2
+            yield( str(mutated) )
+
+    return
